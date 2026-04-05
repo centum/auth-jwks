@@ -24,7 +24,13 @@ class CfaAuthMiddleware(BaseHTTPMiddleware):
         cookie_name: str = "CF_Authorization",
     ) -> None:
         super().__init__(app)
+        if verify_token is None and dev_user is None:
+            raise ValueError("At least one of 'verify_token' or 'dev_user' must be provided")
         self._dev_user = dev_user
+        if dev_user is not None:
+            logger.warning(
+                "CfaAuthMiddleware initialized with dev_user — authentication is bypassed"
+            )
         self._verify_token = verify_token
         self._header_name = header_name
         self._cookie_name = cookie_name

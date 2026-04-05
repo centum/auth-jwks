@@ -61,18 +61,22 @@ class BaseJWKClient(ABC):
             alg = jwk.get("alg")
             if not kid or not alg or alg not in allowed_algorithms:
                 continue
-            if alg == "RS256":
-                keys[kid] = KeyObject(
-                    key=RSAAlgorithm.from_jwk(jwk),
-                    alg=alg,
-                    issuer=issuer,
-                )
-            elif alg == "ES256":
-                keys[kid] = KeyObject(
-                    key=ECAlgorithm.from_jwk(jwk),
-                    alg=alg,
-                    issuer=issuer,
-                )
+            try:
+                if alg == "RS256":
+                    keys[kid] = KeyObject(
+                        key=RSAAlgorithm.from_jwk(jwk),
+                        alg=alg,
+                        issuer=issuer,
+                    )
+                elif alg == "ES256":
+                    keys[kid] = KeyObject(
+                        key=ECAlgorithm.from_jwk(jwk),
+                        alg=alg,
+                        issuer=issuer,
+                    )
+            except (ValueError, KeyError, jwt.InvalidKeyError):
+                logger.warning("Failed to parse JWK kid=%s, skipping", kid)
+                continue
         return keys
 
     async def close(self) -> None:
@@ -89,8 +93,13 @@ class BaseJWKClient(ABC):
             # double-check under lock
             now = time.monotonic()
             if now >= self._expires_at or kid not in self._keys_by_kid:
-                self._keys_by_kid = await self._refresh()
-                self._expires_at = time.monotonic() + self._cache_ttl
+                new_keys = await self._refresh()
+                if new_keys or not self._keys_by_kid:
+                    self._keys_by_kid = new_keys
+                    self._expires_at = time.monotonic() + self._cache_ttl
+                else:
+                    logger.warning("JWKS refresh returned no keys; keeping stale cache")
+                    self._expires_at = time.monotonic() + min(60.0, self._cache_ttl)
 
         key_object = self._keys_by_kid.get(kid)
         if key_object is None:

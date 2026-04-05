@@ -1,5 +1,6 @@
 from unittest.mock import AsyncMock
 
+import pytest
 from starlette.requests import Request
 from starlette.responses import Response
 
@@ -46,7 +47,7 @@ class TestCfaAuthMiddlewareDevMode:
         call_next.assert_called_once_with(request)
 
     async def test_no_dev_user_falls_through_to_token_check(self):
-        middleware = _make_middleware()
+        middleware = _make_middleware(verify_token=AsyncMock())
         request = _make_request()
         call_next = AsyncMock()
 
@@ -56,9 +57,15 @@ class TestCfaAuthMiddlewareDevMode:
         call_next.assert_not_called()
 
 
+class TestCfaAuthMiddlewareInit:
+    def test_raises_when_no_verify_token_and_no_dev_user(self):
+        with pytest.raises(ValueError, match="At least one of"):
+            _make_middleware()
+
+
 class TestCfaAuthMiddlewareProdMode:
     async def test_no_token_returns_401(self):
-        middleware = _make_middleware()
+        middleware = _make_middleware(verify_token=AsyncMock())
         request = _make_request()
         call_next = AsyncMock()
 

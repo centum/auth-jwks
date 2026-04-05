@@ -1,4 +1,5 @@
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -8,6 +9,8 @@ from jwt.types import Options
 from ..base import BaseJWKClient, KeyObject
 
 logger = logging.getLogger(__name__)
+
+_TEAM_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9-]*$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +55,12 @@ class CloudFlareTokenValidation(BaseJWKClient):
         retries: int = 3,
         timeout: float = 5.0,
     ):
+        if not _TEAM_PATTERN.match(team):
+            raise ValueError(
+                f"Invalid team name: {team!r}. Must start with an"
+                " alphanumeric character and contain only"
+                " alphanumeric characters and hyphens."
+            )
         super().__init__(
             leeway=leeway,
             cache_ttl=cache_ttl,
@@ -101,7 +110,7 @@ class CloudFlareTokenValidation(BaseJWKClient):
             "verify_exp": True,
             "verify_iss": True,
             "verify_aud": True,
-            "require": ["exp", "iat", "iss", "aud", "email"],
+            "require": ["exp", "iat", "iss", "aud", "email", "sub"],
         }
 
         return await self._verify_token(
