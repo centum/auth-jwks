@@ -1,6 +1,6 @@
 [project]
 name = "auth-jwks"
-version = "0.2.2"
+version = "0.3.0"
 description = "Async JWKS key fetching, caching, and JWT verification"
 readme = "README.md"
 license = { text = "MIT" }

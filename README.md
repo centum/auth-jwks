@@ -17,6 +17,7 @@ discovery, caching, and verification in one call.
 ## Features
 
 - OpenID Connect discovery (`.well-known/openid-configuration`)
+- Direct JWKS endpoint access (skip discovery with `jwks_uri`)
 - Cloudflare Access token validation + Starlette middleware
 - Async-native (`httpx`), no blocking I/O
 - Auto-caching with configurable TTL (default 15 min)
@@ -52,6 +53,26 @@ await jwks.close()
 
 [Token verification with automatic key discovery, caching, and rotation handling diagram](docs/diagrams/jwks-oidc.md)
 
+
+### Direct JWKS Endpoint
+
+When you already know the JWKS URI and don't need OpenID Connect discovery
+(e.g., AWS Cognito, Firebase, or custom providers):
+
+```python
+from auth_jwks import JWKS
+
+jwks = JWKS(
+    jwks_uri="https://your-provider.example.com/.well-known/jwks.json",
+    issuer="https://your-provider.example.com",
+    aud="your-client-id",
+)
+payload = await jwks.verify_token(token)
+await jwks.close()
+```
+
+This skips the discovery step and fetches keys directly from the JWKS endpoint.
+The `issuer` parameter is optional; when omitted, issuer claim validation is skipped.
 
 ### Cloudflare Access
 
@@ -89,13 +110,18 @@ app.add_middleware(CfaAuthMiddleware, verify_token=cfa.verify_user)
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `discovery_url` | — | OpenID Connect discovery endpoint |
+| `discovery_url` | `None` | OpenID Connect discovery endpoint |
+| `jwks_uri` | `None` | Direct JWKS endpoint URL (skips discovery) |
+| `issuer` | `None` | Expected issuer (required for issuer validation in direct mode) |
 | `aud` | `None` | Expected audience (skip validation if `None`) |
 | `allowed_algorithms` | `{"RS256", "ES256"}` | Accepted signing algorithms |
 | `cache_ttl` | `900` | Key cache lifetime in seconds |
 | `leeway` | `30.0` | Clock skew tolerance in seconds |
 | `timeout` | `5.0` | HTTP request timeout in seconds |
 | `retries` | `3` | HTTP retry count |
+| `fix_local_url` | `True` | Normalize local/Docker URLs (scheme + host replacement) |
+
+At least one of `discovery_url` or `jwks_uri` must be provided. When both are given, `jwks_uri` takes precedence.
 
 ### CloudFlareTokenValidation
 

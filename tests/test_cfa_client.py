@@ -61,7 +61,6 @@ def cfa_client():
 class TestCloudFlareTokenValidationInit:
     def test_init(self):
         client = CloudFlareTokenValidation(aud="test-aud", team="testteam")
-        assert client.aud == "test-aud"
         assert client.issuer == "https://testteam.cloudflareaccess.com"
         assert client.cert_url == "https://testteam.cloudflareaccess.com/cdn-cgi/access/certs"
         assert (

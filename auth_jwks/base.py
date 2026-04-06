@@ -16,16 +16,18 @@ logger = logging.getLogger(__name__)
 class KeyObject(NamedTuple):
     key: Any
     alg: str
-    issuer: str
+    issuer: str | None
 
 
 class BaseJWKClient(ABC):
     def __init__(
         self,
         *,
+        aud: str | None = None,
         cache_ttl: float | int = 900.0,
         leeway: float = 30.0,
     ) -> None:
+        self._aud = aud
         self._leeway = leeway
         self._cache_ttl = cache_ttl
 
@@ -53,7 +55,7 @@ class BaseJWKClient(ABC):
 
     @staticmethod
     def _parse_jwk_keys(
-        jwks_keys: list[dict[str, Any]], issuer: str, allowed_algorithms: set[str]
+        jwks_keys: list[dict[str, Any]], issuer: str | None, allowed_algorithms: set[str]
     ) -> dict[str, KeyObject]:
         keys: dict[str, KeyObject] = {}
         for jwk in jwks_keys:
@@ -134,7 +136,7 @@ class BaseJWKClient(ABC):
                 key_obj.key,
                 algorithms=[key_obj.alg],
                 issuer=key_obj.issuer,
-                audience=audience,
+                audience=audience or self._aud,
                 options=resolved_options,
                 leeway=self._leeway,
             )

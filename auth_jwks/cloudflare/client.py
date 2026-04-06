@@ -62,10 +62,10 @@ class CloudFlareTokenValidation(BaseJWKClient):
                 " alphanumeric characters and hyphens."
             )
         super().__init__(
+            aud=aud,
             leeway=leeway,
             cache_ttl=cache_ttl,
         )
-        self.aud = aud
 
         self.issuer = f"https://{team}.cloudflareaccess.com"
         self.cert_url = f"https://{team}.cloudflareaccess.com/cdn-cgi/access/certs"
@@ -115,7 +115,6 @@ class CloudFlareTokenValidation(BaseJWKClient):
 
         return await self._verify_token(
             token,
-            audience=self.aud,
             options=options,
         )
 
