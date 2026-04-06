@@ -24,107 +24,6 @@ discovery, caching, and verification in one call.
 - Bearer prefix auto-stripping
 - Fully typed (`py.typed`)
 
-## How It Works
-
-### JWKS (OIDC Discovery)
-
-Token verification with automatic key discovery, caching, and rotation handling:
-
-```mermaid
-sequenceDiagram
-    participant App
-    participant auth-jwks
-    participant OIDC as OIDC Provider
-
-    App->>auth-jwks: verify_token(token)
-    auth-jwks->>auth-jwks: strip Bearer prefix, extract kid
-
-    alt Cache hit (kid found & TTL valid)
-        auth-jwks->>auth-jwks: return cached key
-    else Cache miss
-        auth-jwks->>auth-jwks: acquire async lock (double-checked locking)
-        auth-jwks->>OIDC: GET /.well-known/openid-configuration
-        OIDC-->>auth-jwks: { issuer, jwks_uri, ... }
-        auth-jwks->>OIDC: GET {jwks_uri}
-        OIDC-->>auth-jwks: { keys: [...] }
-        auth-jwks->>auth-jwks: parse JWK keys, cache with TTL
-    end
-
-    auth-jwks->>auth-jwks: jwt.decode(token, key, issuer, audience)
-    auth-jwks-->>App: decoded payload
-```
-
-### Cloudflare Access
-
-Token validation against Cloudflare's certs endpoint with optional identity enrichment:
-
-```mermaid
-sequenceDiagram
-    participant App
-    participant auth-jwks
-    participant CF as Cloudflare Access
-
-    App->>auth-jwks: verify_user(token)
-    auth-jwks->>auth-jwks: strip Bearer prefix, extract kid
-
-    alt Cache hit (kid found & TTL valid)
-        auth-jwks->>auth-jwks: return cached key
-    else Cache miss
-        auth-jwks->>auth-jwks: acquire async lock (double-checked locking)
-        auth-jwks->>CF: GET /cdn-cgi/access/certs
-        CF-->>auth-jwks: { keys: [...] }
-        auth-jwks->>auth-jwks: parse JWK keys, cache with TTL
-    end
-
-    auth-jwks->>auth-jwks: jwt.decode(token, key, aud, issuer)
-    auth-jwks-->>App: User(sub, email, country)
-
-    opt get_identity (optional enrichment)
-        App->>auth-jwks: get_identity(token)
-        auth-jwks->>CF: GET /cdn-cgi/access/get-identity (cookie: CF_Authorization)
-        CF-->>auth-jwks: { email, user_uuid, ip, geo, ... }
-        auth-jwks-->>App: Identity(email, user_uuid, account_id, ...)
-    end
-```
-
-### Starlette Middleware
-
-Request authentication flow with dev bypass and automatic token extraction:
-
-```mermaid
-sequenceDiagram
-    participant Client
-    participant MW as CfaAuthMiddleware
-    participant auth-jwks
-    participant App as App Handler
-
-    Client->>MW: HTTP request
-
-    alt dev_user configured (development bypass)
-        MW->>MW: set request.state.user = dev_user
-        MW->>App: call_next(request)
-        App-->>Client: response
-    else Production mode
-        MW->>MW: extract token from header (Cf-Access-Jwt-Assertion) or cookie (CF_Authorization)
-
-        alt No token found
-            MW-->>Client: 401 {"detail": "Invalid CFA Token"}
-        else Token present
-            MW->>auth-jwks: verify_user(token)
-
-            alt Verification succeeds
-                auth-jwks-->>MW: User(sub, email, country)
-                MW->>MW: set request.state.user
-                MW->>App: call_next(request)
-                App-->>Client: response
-            else Verification fails
-                auth-jwks-->>MW: raise Exception
-                MW-->>Client: 401 {"detail": "CFA token verification failed"}
-            end
-        end
-    end
-```
-
 ## Installation
 
 ```bash
@@ -151,6 +50,9 @@ payload = await jwks.verify_token(token)
 await jwks.close()
 ```
 
+[Token verification with automatic key discovery, caching, and rotation handling diagram](docs/diagrams/jwks-oidc.md)
+
+
 ### Cloudflare Access
 
 Validate Cloudflare Access JWT tokens and extract user identity:
@@ -165,6 +67,8 @@ identity = await cfa.get_identity(token) # -> Identity (full CF profile)
 await cfa.close()
 ```
 
+[Token validation against Cloudflare's certs endpoint with optional identity enrichment diagram](docs/diagrams/cf-access.md)
+
 ### Starlette / FastAPI Middleware
 
 Protect routes with Cloudflare Access authentication:
@@ -176,6 +80,8 @@ cfa = CloudFlareTokenValidation(aud="your-aud", team="your-team")
 app.add_middleware(CfaAuthMiddleware, verify_token=cfa.verify_user)
 # request.state.user -> User(sub, email, country)
 ```
+
+[Request authentication flow with dev bypass and automatic token extraction diagram](docs/diagrams/middleware.md)
 
 ## Configuration
 
