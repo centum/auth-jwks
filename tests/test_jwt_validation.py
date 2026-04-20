@@ -1,4 +1,5 @@
 import json
+import logging
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -6,7 +7,8 @@ import jwt as pyjwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-from auth_jwks.jwt_validation import JWKS
+import auth_jwks
+from auth_jwks.jwt_validation import JWKS, IssuerMismatchError
 
 
 def _generate_rsa_keypair():
@@ -97,15 +99,73 @@ class TestJWKS:
         assert jwks._issuer == "https://issuer.example.com"
         assert jwks._jwks_uri == "https://example.com/jwks"
 
-    def test_init_discovery_url_with_issuer_raises(self, discovery_url):
-        with pytest.raises(ValueError, match="'issuer' cannot be used with 'discovery_url' alone"):
-            JWKS(discovery_url, issuer="https://custom.issuer.com")
+    def test_init_discovery_url_with_issuer_no_longer_raises(self, discovery_url):
+        jwks = JWKS(discovery_url, issuer="https://explicit.example.com")
+        assert jwks._issuer == "https://explicit.example.com"
+
+    def test_init_discovery_only_logs_warning(self, discovery_url, caplog):
+        with caplog.at_level(logging.WARNING, logger="auth_jwks.jwt_validation"):
+            JWKS(discovery_url)
+        defence_warnings = [
+            r
+            for r in caplog.records
+            if "defence-in-depth" in r.message and r.levelno == logging.WARNING
+        ]
+        assert len(defence_warnings) == 1
+
+    def test_init_discovery_with_issuer_does_not_log_warning(self, discovery_url, caplog):
+        with caplog.at_level(logging.WARNING, logger="auth_jwks.jwt_validation"):
+            JWKS(discovery_url, issuer="https://explicit.example.com")
+        assert not any("defence-in-depth" in record.message for record in caplog.records)
+
+    def test_init_direct_mode_without_issuer_logs_warning(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="auth_jwks.jwt_validation"):
+            JWKS(jwks_uri="https://example.com/jwks")
+        issuer_warnings = [
+            r
+            for r in caplog.records
+            if "issuer" in r.message.lower() and r.levelno == logging.WARNING
+        ]
+        assert len(issuer_warnings) == 1
+
+    def test_init_both_urls_no_issuer_emits_direct_mode_warning(self, discovery_url, caplog):
+        """When both discovery_url and jwks_uri are given without issuer=,
+        the direct-mode warning fires (jwks_uri takes precedence, issuer validation is skipped)
+        but the discovery defence-in-depth warning does NOT fire."""
+        with caplog.at_level(logging.WARNING, logger="auth_jwks.jwt_validation"):
+            JWKS(discovery_url, jwks_uri="https://example.com/jwks")
+        issuer_warnings = [
+            r
+            for r in caplog.records
+            if "issuer claim validation" in r.message and r.levelno == logging.WARNING
+        ]
+        assert len(issuer_warnings) == 1
+        assert not any("defence-in-depth" in record.message for record in caplog.records)
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"discovery_url": "https://issuer.example.com/.well-known/openid-configuration"},
+            {"jwks_uri": "https://example.com/jwks"},
+        ],
+    )
+    @pytest.mark.parametrize("bad_issuer", ["", "   "])
+    def test_init_empty_issuer_raises(self, kwargs, bad_issuer):
+        with pytest.raises(ValueError, match="'issuer' must be a non-empty string or None"):
+            JWKS(**kwargs, issuer=bad_issuer)
 
     def test_init_both_urls_with_issuer_allowed(self, discovery_url):
         jwks = JWKS(
             discovery_url, jwks_uri="https://example.com/jwks", issuer="https://custom.issuer.com"
         )
         assert jwks._issuer == "https://custom.issuer.com"
+
+    def test_issuer_mismatch_error_is_invalid_token_error_subclass(self):
+        assert issubclass(IssuerMismatchError, pyjwt.InvalidTokenError) is True
+
+    def test_issuer_mismatch_error_importable_from_package(self):
+        assert hasattr(auth_jwks, "IssuerMismatchError")
+        assert auth_jwks.IssuerMismatchError is IssuerMismatchError
 
     def test_normalize_url_fixes_scheme(self, discovery_url):
         jwks = JWKS(discovery_url)
@@ -175,63 +235,6 @@ class TestJWKS:
         assert len(keys) == 0
         await jwks_client.close()
 
-    async def test_verify_token_success(self, rsa_key, jwk, httpx_mock, discovery_url):
-        httpx_mock.add_response(
-            url=discovery_url,
-            json={
-                "issuer": "https://issuer.example.com",
-                "jwks_uri": "https://issuer.example.com/jwks",
-            },
-        )
-        httpx_mock.add_response(
-            url="https://issuer.example.com/jwks",
-            json={"keys": [jwk]},
-        )
-
-        token = _make_signed_token(rsa_key)
-        jwks_client = JWKS(discovery_url, aud="test-audience", leeway=60)
-        payload = await jwks_client.verify_token(token)
-        assert payload["sub"] == "user-123"
-        await jwks_client.close()
-
-    async def test_verify_token_with_bearer_prefix(self, rsa_key, jwk, httpx_mock, discovery_url):
-        httpx_mock.add_response(
-            url=discovery_url,
-            json={
-                "issuer": "https://issuer.example.com",
-                "jwks_uri": "https://issuer.example.com/jwks",
-            },
-        )
-        httpx_mock.add_response(
-            url="https://issuer.example.com/jwks",
-            json={"keys": [jwk]},
-        )
-
-        token = _make_signed_token(rsa_key)
-        jwks_client = JWKS(discovery_url, aud="test-audience", leeway=60)
-        payload = await jwks_client.verify_token(f"Bearer {token}")
-        assert payload["sub"] == "user-123"
-        await jwks_client.close()
-
-    async def test_verify_token_no_audience(self, rsa_key, jwk, httpx_mock, discovery_url):
-        httpx_mock.add_response(
-            url=discovery_url,
-            json={
-                "issuer": "https://issuer.example.com",
-                "jwks_uri": "https://issuer.example.com/jwks",
-            },
-        )
-        httpx_mock.add_response(
-            url="https://issuer.example.com/jwks",
-            json={"keys": [jwk]},
-        )
-
-        token = _make_signed_token(rsa_key, payload={"aud": None})
-        jwks_client = JWKS(discovery_url, aud=None, leeway=60)
-        payload = await jwks_client.verify_token(token)
-        assert payload["sub"] == "user-123"
-        await jwks_client.close()
-
     async def test_refresh_direct_jwks_uri_single_http_call(self, jwk, httpx_mock):
         """_refresh() with jwks_uri only fetches keys directly (single HTTP call, no discovery)."""
         jwks_uri = "https://example.com/.well-known/jwks.json"
@@ -297,6 +300,231 @@ class TestJWKS:
         assert len(httpx_mock.get_requests()) == 2
         await jwks_client.close()
 
+    async def test_refresh_direct_jwks_uri_http_error(self, httpx_mock):
+        """_refresh() raises on HTTP error from jwks_uri endpoint."""
+        jwks_uri = "https://example.com/.well-known/jwks.json"
+        httpx_mock.add_response(url=jwks_uri, status_code=500)
+
+        jwks_client = JWKS(jwks_uri=jwks_uri)
+        with pytest.raises(httpx.HTTPStatusError):
+            await jwks_client._refresh()
+        await jwks_client.close()
+
+    async def test_refresh_direct_jwks_uri_empty_keys(self, rsa_key, httpx_mock):
+        """verify_token() fails when jwks_uri returns no usable keys."""
+        jwks_uri = "https://example.com/.well-known/jwks.json"
+        httpx_mock.add_response(
+            url=jwks_uri,
+            json={"keys": []},
+        )
+
+        token = _make_signed_token(rsa_key)
+        jwks_client = JWKS(jwks_uri=jwks_uri, aud="test-audience", leeway=60)
+        with pytest.raises(pyjwt.InvalidTokenError):
+            await jwks_client.verify_token(token)
+        await jwks_client.close()
+
+    async def test_refresh_direct_jwks_uri_precedence_over_discovery(
+        self, jwk, httpx_mock, discovery_url
+    ):
+        """When both discovery_url and jwks_uri are provided, only jwks_uri is fetched."""
+        jwks_uri = "https://example.com/.well-known/jwks.json"
+        httpx_mock.add_response(
+            url=jwks_uri,
+            json={"keys": [jwk]},
+        )
+        # No mock for discovery_url -- if it's fetched, httpx_mock will raise
+
+        jwks_client = JWKS(discovery_url, jwks_uri=jwks_uri, issuer="https://example.com")
+        keys = await jwks_client._refresh()
+        assert "test-kid" in keys
+        assert len(httpx_mock.get_requests()) == 1
+        assert httpx_mock.get_requests()[0].url == jwks_uri
+        await jwks_client.close()
+
+    async def test_refresh_with_matching_issuer_uses_configured_value(
+        self, jwk, httpx_mock, discovery_url
+    ):
+        """discovery returns iss=X, construct with issuer=X → keys carry issuer=X."""
+        httpx_mock.add_response(
+            url=discovery_url,
+            json={
+                "issuer": "https://issuer.example.com",
+                "jwks_uri": "https://issuer.example.com/.well-known/jwks.json",
+            },
+        )
+        httpx_mock.add_response(
+            url="https://issuer.example.com/.well-known/jwks.json",
+            json={"keys": [jwk]},
+        )
+
+        jwks_client = JWKS(discovery_url, issuer="https://issuer.example.com")
+        keys = await jwks_client._refresh()
+        assert keys["test-kid"].issuer == "https://issuer.example.com"
+        await jwks_client.close()
+
+    async def test_refresh_with_mismatched_issuer_raises_issuer_mismatch_error(
+        self, jwk, httpx_mock, discovery_url
+    ):
+        """discovery returns iss=X, construct with issuer=Y → IssuerMismatchError raised."""
+        httpx_mock.add_response(
+            url=discovery_url,
+            json={
+                "issuer": "https://issuer.example.com",
+                "jwks_uri": "https://issuer.example.com/.well-known/jwks.json",
+            },
+        )
+
+        jwks_client = JWKS(discovery_url, issuer="https://other-issuer.example.com")
+        with pytest.raises(IssuerMismatchError) as exc_info:
+            await jwks_client._refresh()
+        # Must also be catchable as jwt.InvalidTokenError
+        assert isinstance(exc_info.value, pyjwt.InvalidTokenError)
+        # Error message must mention both values
+        assert "https://issuer.example.com" in str(exc_info.value)
+        assert "https://other-issuer.example.com" in str(exc_info.value)
+        # Only discovery request made — mismatch raised before JWKS fetch
+        assert len(httpx_mock.get_requests()) == 1
+        await jwks_client.close()
+
+    async def test_refresh_without_explicit_issuer_uses_discovery_value(
+        self, jwk, httpx_mock, discovery_url
+    ):
+        """Backward compat: discovery returns iss=X, no issuer= → keys carry issuer=X."""
+        httpx_mock.add_response(
+            url=discovery_url,
+            json={
+                "issuer": "https://issuer.example.com",
+                "jwks_uri": "https://issuer.example.com/.well-known/jwks.json",
+            },
+        )
+        httpx_mock.add_response(
+            url="https://issuer.example.com/.well-known/jwks.json",
+            json={"keys": [jwk]},
+        )
+
+        jwks_client = JWKS(discovery_url)
+        keys = await jwks_client._refresh()
+        assert keys["test-kid"].issuer == "https://issuer.example.com"
+        await jwks_client.close()
+
+    async def test_refresh_mismatch_does_not_poison_cache(
+        self, rsa_key, jwk, httpx_mock, discovery_url
+    ):
+        """After a mismatch error, cache remains empty and expiry not advanced.
+
+        Uses verify_token() (the real execution path: get_key → _refresh) rather than calling
+        _refresh() directly, so any future regression that updates cache inside get_key() before
+        the exception propagates will be caught.
+        """
+        httpx_mock.add_response(
+            url=discovery_url,
+            json={
+                "issuer": "https://issuer.example.com",
+                "jwks_uri": "https://issuer.example.com/.well-known/jwks.json",
+            },
+        )
+
+        token = _make_signed_token(rsa_key)
+        jwks_client = JWKS(
+            discovery_url,
+            issuer="https://wrong-issuer.example.com",
+            aud="test-audience",
+            leeway=60,
+        )
+        # Confirm initial state: _expires_at starts at 0.0 (never refreshed)
+        assert jwks_client._expires_at == 0.0
+        with pytest.raises(IssuerMismatchError):
+            await jwks_client.verify_token(token)
+        # Cache must still be empty — mismatch must not have populated keys
+        assert jwks_client._keys_by_kid == {}
+        # expiry must remain at 0.0 — not advanced to a future value
+        assert jwks_client._expires_at == 0.0
+        await jwks_client.close()
+
+    async def test_refresh_both_urls_skips_discovery_mismatch_check(
+        self, jwk, httpx_mock, discovery_url
+    ):
+        """When both discovery_url and jwks_uri are set, _refresh() uses direct mode only.
+        Discovery endpoint must NOT be called even if it would return a mismatched issuer."""
+        jwks_uri = "https://example.com/.well-known/jwks.json"
+        httpx_mock.add_response(
+            url=jwks_uri,
+            json={"keys": [jwk]},
+        )
+        # No mock for discovery_url — any request to it would raise in httpx_mock
+
+        jwks_client = JWKS(
+            discovery_url,
+            jwks_uri=jwks_uri,
+            issuer="https://configured.example.com",
+        )
+        keys = await jwks_client._refresh()
+        assert "test-kid" in keys
+        assert keys["test-kid"].issuer == "https://configured.example.com"
+        # Only one HTTP request made — the direct jwks_uri fetch
+        requests = httpx_mock.get_requests()
+        assert len(requests) == 1
+        assert str(requests[0].url) == jwks_uri
+        await jwks_client.close()
+
+    async def test_verify_token_success(self, rsa_key, jwk, httpx_mock, discovery_url):
+        httpx_mock.add_response(
+            url=discovery_url,
+            json={
+                "issuer": "https://issuer.example.com",
+                "jwks_uri": "https://issuer.example.com/jwks",
+            },
+        )
+        httpx_mock.add_response(
+            url="https://issuer.example.com/jwks",
+            json={"keys": [jwk]},
+        )
+
+        token = _make_signed_token(rsa_key)
+        jwks_client = JWKS(discovery_url, aud="test-audience", leeway=60)
+        payload = await jwks_client.verify_token(token)
+        assert payload["sub"] == "user-123"
+        await jwks_client.close()
+
+    async def test_verify_token_with_bearer_prefix(self, rsa_key, jwk, httpx_mock, discovery_url):
+        httpx_mock.add_response(
+            url=discovery_url,
+            json={
+                "issuer": "https://issuer.example.com",
+                "jwks_uri": "https://issuer.example.com/jwks",
+            },
+        )
+        httpx_mock.add_response(
+            url="https://issuer.example.com/jwks",
+            json={"keys": [jwk]},
+        )
+
+        token = _make_signed_token(rsa_key)
+        jwks_client = JWKS(discovery_url, aud="test-audience", leeway=60)
+        payload = await jwks_client.verify_token(f"Bearer {token}")
+        assert payload["sub"] == "user-123"
+        await jwks_client.close()
+
+    async def test_verify_token_no_audience(self, rsa_key, jwk, httpx_mock, discovery_url):
+        httpx_mock.add_response(
+            url=discovery_url,
+            json={
+                "issuer": "https://issuer.example.com",
+                "jwks_uri": "https://issuer.example.com/jwks",
+            },
+        )
+        httpx_mock.add_response(
+            url="https://issuer.example.com/jwks",
+            json={"keys": [jwk]},
+        )
+
+        token = _make_signed_token(rsa_key, payload={"aud": None})
+        jwks_client = JWKS(discovery_url, aud=None, leeway=60)
+        payload = await jwks_client.verify_token(token)
+        assert payload["sub"] == "user-123"
+        await jwks_client.close()
+
     async def test_verify_token_direct_jwks_uri_with_issuer(self, rsa_key, jwk, httpx_mock):
         """verify_token() succeeds with direct jwks_uri + matching issuer."""
         jwks_uri = "https://example.com/.well-known/jwks.json"
@@ -350,7 +578,7 @@ class TestJWKS:
             aud="test-audience",
             leeway=60,
         )
-        with pytest.raises(pyjwt.InvalidTokenError):
+        with pytest.raises(pyjwt.InvalidIssuerError):
             await jwks_client.verify_token(token)
         await jwks_client.close()
 
@@ -368,53 +596,12 @@ class TestJWKS:
         assert payload["sub"] == "user-123"
         await jwks_client.close()
 
-    async def test_refresh_direct_jwks_uri_http_error(self, httpx_mock):
-        """_refresh() raises on HTTP error from jwks_uri endpoint."""
-        jwks_uri = "https://example.com/.well-known/jwks.json"
-        httpx_mock.add_response(url=jwks_uri, status_code=500)
-
-        jwks_client = JWKS(jwks_uri=jwks_uri)
-        with pytest.raises(httpx.HTTPStatusError):
-            await jwks_client._refresh()
-        await jwks_client.close()
-
-    async def test_refresh_direct_jwks_uri_empty_keys(self, rsa_key, httpx_mock):
-        """verify_token() fails when jwks_uri returns no usable keys."""
-        jwks_uri = "https://example.com/.well-known/jwks.json"
-        httpx_mock.add_response(
-            url=jwks_uri,
-            json={"keys": []},
-        )
-
-        token = _make_signed_token(rsa_key)
-        jwks_client = JWKS(jwks_uri=jwks_uri, aud="test-audience", leeway=60)
-        with pytest.raises(pyjwt.InvalidTokenError):
-            await jwks_client.verify_token(token)
-        await jwks_client.close()
-
-    async def test_refresh_direct_jwks_uri_precedence_over_discovery(
-        self, jwk, httpx_mock, discovery_url
-    ):
-        """When both discovery_url and jwks_uri are provided, only jwks_uri is fetched."""
-        jwks_uri = "https://example.com/.well-known/jwks.json"
-        httpx_mock.add_response(
-            url=jwks_uri,
-            json={"keys": [jwk]},
-        )
-        # No mock for discovery_url -- if it's fetched, httpx_mock will raise
-
-        jwks_client = JWKS(discovery_url, jwks_uri=jwks_uri, issuer="https://example.com")
-        keys = await jwks_client._refresh()
-        assert "test-kid" in keys
-        assert len(httpx_mock.get_requests()) == 1
-        assert httpx_mock.get_requests()[0].url == jwks_uri
-        await jwks_client.close()
-
     async def test_verify_token_both_urls_no_issuer_skips_iss_validation(
         self, rsa_key, jwk, httpx_mock, discovery_url
     ):
         """When both discovery_url and jwks_uri are provided without explicit issuer,
-        issuer validation is skipped (consistent with pure direct mode).
+        effective_verify_iss defaults to False (consistent with pure direct mode).
+        verify_iss defaults to True — the effective behaviour is derived internally.
         Uses a token WITHOUT iss to prove the claim is not required."""
         jwks_uri = "https://example.com/.well-known/jwks.json"
         httpx_mock.add_response(
@@ -434,9 +621,116 @@ class TestJWKS:
             no_iss_payload, rsa_key, algorithm="RS256", headers={"kid": "test-kid"}
         )
         jwks_client = JWKS(discovery_url, jwks_uri=jwks_uri, aud="test-audience", leeway=60)
-        payload = await jwks_client.verify_token(token, verify_iss=False)
+        # verify_iss left at default True — effective_verify_iss=False because jwks_uri
+        # is set and issuer=None, so iss is not required and the token passes validation
+        payload = await jwks_client.verify_token(token)
         assert payload["sub"] == "user-123"
         assert "iss" not in payload
+        await jwks_client.close()
+
+    async def test_verify_token_discovery_with_matching_issuer_success(
+        self, rsa_key, jwk, httpx_mock, discovery_url
+    ):
+        """Full path: discovery + matching issuer= + signed token with iss=X validates
+        successfully."""
+        httpx_mock.add_response(
+            url=discovery_url,
+            json={
+                "issuer": "https://issuer.example.com",
+                "jwks_uri": "https://issuer.example.com/jwks",
+            },
+        )
+        httpx_mock.add_response(
+            url="https://issuer.example.com/jwks",
+            json={"keys": [jwk]},
+        )
+
+        token = _make_signed_token(rsa_key)  # iss="https://issuer.example.com"
+        jwks_client = JWKS(
+            discovery_url,
+            issuer="https://issuer.example.com",
+            aud="test-audience",
+            leeway=60,
+        )
+        payload = await jwks_client.verify_token(token)
+        assert payload["sub"] == "user-123"
+        assert payload["iss"] == "https://issuer.example.com"
+        await jwks_client.close()
+
+    async def test_verify_token_discovery_with_mismatched_issuer_raises(
+        self, rsa_key, jwk, httpx_mock, discovery_url
+    ):
+        """Full path: discovery returns iss=X, configured issuer=Y → IssuerMismatchError raised.
+        Confirms that the subclass propagates cleanly through base._verify_token
+        exception handling."""
+        httpx_mock.add_response(
+            url=discovery_url,
+            json={
+                "issuer": "https://issuer.example.com",
+                "jwks_uri": "https://issuer.example.com/jwks",
+            },
+        )
+
+        token = _make_signed_token(rsa_key)
+        jwks_client = JWKS(
+            discovery_url,
+            issuer="https://other-issuer.example.com",
+            aud="test-audience",
+            leeway=60,
+        )
+        with pytest.raises(IssuerMismatchError) as exc_info:
+            await jwks_client.verify_token(token)
+        # Must also be catchable as jwt.InvalidTokenError
+        assert isinstance(exc_info.value, pyjwt.InvalidTokenError)
+        await jwks_client.close()
+
+    async def test_verify_token_discovery_only_backward_compat(
+        self, rsa_key, jwk, httpx_mock, discovery_url
+    ):
+        """No explicit issuer=, token with iss matching discovery validates successfully.
+        Regression: ensures no behaviour change for existing consumers."""
+        httpx_mock.add_response(
+            url=discovery_url,
+            json={
+                "issuer": "https://issuer.example.com",
+                "jwks_uri": "https://issuer.example.com/jwks",
+            },
+        )
+        httpx_mock.add_response(
+            url="https://issuer.example.com/jwks",
+            json={"keys": [jwk]},
+        )
+
+        token = _make_signed_token(rsa_key)  # iss="https://issuer.example.com"
+        jwks_client = JWKS(discovery_url, aud="test-audience", leeway=60)
+        payload = await jwks_client.verify_token(token)
+        assert payload["sub"] == "user-123"
+        assert payload["iss"] == "https://issuer.example.com"
+        await jwks_client.close()
+
+    async def test_verify_token_discovery_only_rejects_token_with_foreign_iss(
+        self, rsa_key, jwk, httpx_mock, discovery_url
+    ):
+        """No explicit issuer=, signed token has iss that does NOT match discovery's issuer.
+        verify_token raises jwt.InvalidIssuerError (PyJWT native exception).
+        Regression guard: ensures discovery-only mode still validates iss against
+        discovery's value."""
+        httpx_mock.add_response(
+            url=discovery_url,
+            json={
+                "issuer": "https://issuer.example.com",
+                "jwks_uri": "https://issuer.example.com/jwks",
+            },
+        )
+        httpx_mock.add_response(
+            url="https://issuer.example.com/jwks",
+            json={"keys": [jwk]},
+        )
+
+        token = _make_signed_token(rsa_key, payload={"iss": "https://foreign-issuer.example.com"})
+        jwks_client = JWKS(discovery_url, aud="test-audience", leeway=60)
+        with pytest.raises(pyjwt.InvalidIssuerError):
+            await jwks_client.verify_token(token)
         await jwks_client.close()
 
     async def test_close(self, discovery_url):

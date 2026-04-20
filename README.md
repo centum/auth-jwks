@@ -18,6 +18,7 @@ discovery, caching, and verification in one call.
 
 - OpenID Connect discovery (`.well-known/openid-configuration`)
 - Direct JWKS endpoint access (skip discovery with `jwks_uri`)
+- Strict issuer cross-check against OIDC discovery document (`IssuerMismatchError`)
 - Cloudflare Access token validation + Starlette middleware
 - Async-native (`httpx`), no blocking I/O
 - Auto-caching with configurable TTL (default 15 min)
@@ -45,6 +46,7 @@ from auth_jwks import JWKS
 
 jwks = JWKS(
     discovery_url="https://your-issuer/.well-known/openid-configuration",
+    issuer="https://your-issuer",   # recommended: cross-checked against discovery
     aud="your-client-id",
 )
 payload = await jwks.verify_token(token)
@@ -52,6 +54,42 @@ await jwks.close()
 ```
 
 [Token verification with automatic key discovery, caching, and rotation handling diagram](docs/diagrams/jwks-oidc.md)
+
+#### Security: strict issuer validation
+
+When `issuer=` is provided in discovery mode, `auth-jwks` cross-checks the
+configured value against the `issuer` field in the OIDC discovery document on
+every cache refresh. If they disagree, an `IssuerMismatchError` (a subclass of
+`jwt.InvalidTokenError`) is raised before any keys are trusted.
+
+This prevents silent acceptance of tokens from a misconfigured or foreign IAM
+tenant — for example, if `discovery_url` is accidentally pointed at the wrong
+environment. The configured `issuer` becomes the authoritative anchor for PyJWT
+validation instead of whatever the discovery document returns.
+
+```python
+from auth_jwks import JWKS, IssuerMismatchError
+import jwt
+
+jwks = JWKS(
+    discovery_url="https://your-issuer/.well-known/openid-configuration",
+    issuer="https://your-issuer",
+    aud="your-client-id",
+)
+
+try:
+    payload = await jwks.verify_token(token)
+except IssuerMismatchError:
+    # discovery URL pointed at wrong tenant — treat as configuration error
+    raise
+except jwt.InvalidTokenError:
+    # token itself is invalid
+    raise
+```
+
+Without an explicit `issuer=`, the library trusts the issuer from the discovery
+document unconditionally and emits a `WARNING` log recommending the explicit
+form for production deployments.
 
 
 ### Direct JWKS Endpoint
@@ -112,7 +150,7 @@ app.add_middleware(CfaAuthMiddleware, verify_token=cfa.verify_user)
 |-----------|---------|-------------|
 | `discovery_url` | `None` | OpenID Connect discovery endpoint |
 | `jwks_uri` | `None` | Direct JWKS endpoint URL (skips discovery) |
-| `issuer` | `None` | Expected issuer (required for issuer validation in direct mode) |
+| `issuer` | `None` | Expected issuer. In discovery mode: cross-checked against OIDC document (recommended for production). In direct mode: used for PyJWT issuer validation. Must be a non-empty string or `None`. |
 | `aud` | `None` | Expected audience (skip validation if `None`) |
 | `allowed_algorithms` | `{"RS256", "ES256"}` | Accepted signing algorithms |
 | `cache_ttl` | `900` | Key cache lifetime in seconds |
@@ -122,6 +160,10 @@ app.add_middleware(CfaAuthMiddleware, verify_token=cfa.verify_user)
 | `fix_local_url` | `True` | Normalize local/Docker URLs (scheme + host replacement) |
 
 At least one of `discovery_url` or `jwks_uri` must be provided. When both are given, `jwks_uri` takes precedence.
+
+### Upgrading
+
+**`issuer=""` is now rejected** — passing an empty string for `issuer` raises `ValueError` in both discovery and direct mode. Previously an empty string was silently accepted with ambiguous results: in discovery mode it raised a `ValueError` internally (no-op), while in direct `jwks_uri` mode PyJWT would validate the `iss` claim against an empty string and silently reject all real tokens. Neither behaviour was intentional or useful. To skip issuer validation explicitly, pass `issuer=None` (the default); to validate the issuer, pass a non-empty string.
 
 ### CloudFlareTokenValidation
 
@@ -135,6 +177,8 @@ At least one of `discovery_url` or `jwks_uri` must be provided. When both are gi
 
 All clients must be closed after use (`await client.close()`).
 Token methods raise `jwt.InvalidTokenError` on validation failure.
+`IssuerMismatchError` (importable from `auth_jwks`) is a subclass of `jwt.InvalidTokenError`
+raised when a configured issuer disagrees with the OIDC discovery document.
 
 ## License
 

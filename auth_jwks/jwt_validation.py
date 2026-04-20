@@ -12,6 +12,10 @@ from .base import BaseJWKClient, KeyObject
 logger = logging.getLogger(__name__)
 
 
+class IssuerMismatchError(jwt.InvalidTokenError):
+    """Raised when configured issuer disagrees with OIDC discovery document."""
+
+
 class JWKS(BaseJWKClient):
     def __init__(
         self,
@@ -27,17 +31,60 @@ class JWKS(BaseJWKClient):
         jwks_uri: str | None = None,
         issuer: str | None = None,
     ) -> None:
+        """Initialise the JWKS client.
+
+        At least one of ``discovery_url`` or ``jwks_uri`` must be provided.
+        When both are given, ``jwks_uri`` takes precedence and discovery is skipped.
+
+        Parameters:
+            discovery_url: OpenID Connect discovery endpoint
+                (``.well-known/openid-configuration``).
+            aud: Expected audience claim value. Validation is skipped when ``None``.
+            allowed_algorithms: Set of accepted signing algorithms.
+                Defaults to ``{"RS256", "ES256"}``.
+            cache_ttl: Key cache lifetime in seconds (default 900 = 15 min).
+            leeway: Clock skew tolerance in seconds for ``exp``/``nbf`` checks.
+            timeout: HTTP request timeout in seconds.
+            retries: Number of HTTP retries on transient failures.
+            fix_local_url: When ``True``, normalize the scheme and host of
+                ``jwks_uri`` discovered from the OIDC document to match the
+                ``discovery_url`` (useful for local/Docker environments).
+            jwks_uri: Direct JWKS endpoint URL. When provided, discovery is
+                skipped and keys are fetched from this URL directly.
+            issuer: Expected issuer claim value (non-empty string or ``None``).
+                In discovery mode: cross-checked against the OIDC document's ``issuer``
+                field on every cache refresh; raises :exc:`IssuerMismatchError` on
+                disagreement. When omitted, the discovery document is trusted
+                unconditionally and a ``WARNING`` is emitted.
+                In direct mode: passed to PyJWT for ``iss`` validation; omitting it
+                skips issuer validation entirely.
+                Passing ``issuer=""`` raises :exc:`ValueError`.
+
+        Raises:
+            ValueError: If neither ``discovery_url`` nor ``jwks_uri`` is provided,
+                or if ``issuer`` is an empty string.
+            IssuerMismatchError: Raised during ``_refresh()`` (not at construction
+                time) when the configured ``issuer`` disagrees with the OIDC
+                discovery document's ``issuer`` field.
+                :exc:`IssuerMismatchError` is a subclass of
+                ``jwt.InvalidTokenError``, so existing
+                ``except jwt.InvalidTokenError:`` blocks continue to work without
+                modification.
+        """
         if discovery_url is None and jwks_uri is None:
             msg = "Either 'discovery_url' or 'jwks_uri' must be provided"
             raise ValueError(msg)
 
-        if discovery_url is not None and issuer is not None and jwks_uri is None:
-            msg = (
-                "'issuer' cannot be used with 'discovery_url' alone"
-                " (issuer is obtained from discovery);"
-                " use 'jwks_uri' for explicit issuer control"
-            )
+        if issuer is not None and not issuer.strip():
+            msg = "'issuer' must be a non-empty string or None"
             raise ValueError(msg)
+
+        if discovery_url is not None and jwks_uri is None and issuer is None:
+            logger.warning(
+                "Discovery mode without explicit issuer: library will trust the issuer from OIDC"
+                " document. For defence-in-depth, pass 'issuer=...' so its value is cross-checked"
+                " against discovery."
+            )
 
         if jwks_uri is not None and issuer is None:
             logger.warning(
@@ -72,7 +119,10 @@ class JWKS(BaseJWKClient):
         self._fix_local_url = fix_local_url
 
     def _normalize_url(self, url: str) -> str:
-        """Fix jwks_uri for short access to hydra"""
+        """Normalize scheme and host of a JWKS URI to match the discovery URL.
+
+        Useful for local/Docker environments where the JWKS URI hostname differs.
+        """
         if not self._fix_local_url:
             return url
         return str(urlunparse(urlparse(url)._replace(scheme=self._scheme, netloc=self._netloc)))
@@ -98,9 +148,18 @@ class JWKS(BaseJWKClient):
 
         logger.debug("OpenID Configuration discovery from %s -> %s", self._discovery_url, conf)
 
-        issuer = conf.get("issuer")
-        if not issuer:
+        discovery_issuer = conf.get("issuer")
+        if not discovery_issuer:
             raise jwt.InvalidTokenError("OpenID discovery response missing issuer")
+
+        if self._issuer is not None and discovery_issuer != self._issuer:
+            msg = (
+                f"Issuer mismatch: configured '{self._issuer}' "
+                f"differs from discovery document '{discovery_issuer}'"
+            )
+            raise IssuerMismatchError(msg)
+
+        effective_issuer = self._issuer if self._issuer is not None else discovery_issuer
 
         jwks_uri = conf.get("jwks_uri")
         if not jwks_uri:
@@ -111,7 +170,9 @@ class JWKS(BaseJWKClient):
         r.raise_for_status()
         jwks = r.json()
 
-        return self._parse_jwk_keys(jwks.get("keys", []), issuer, self._allowed_algorithms)
+        return self._parse_jwk_keys(
+            jwks.get("keys", []), effective_issuer, self._allowed_algorithms
+        )
 
     async def verify_token(
         self,
