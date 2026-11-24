@@ -1,3 +1,6 @@
+import asyncio
+import logging
+
 import jwt as pyjwt
 import pytest
 
@@ -91,6 +94,60 @@ class TestBaseJWKClientGetKey:
         key_obj2 = KeyObject(key="pub2", alg="RS256", issuer="iss")
         client._test_keys["kid2"] = key_obj2
 
+        client._refreshed_at -= client.unknown_kid_refresh_interval
         result = await client.get_key("kid2")
         assert result == key_obj2
         assert client.refresh_count == 2
+
+    async def test_unknown_kid_refresh_is_throttled(self):
+        key_obj = KeyObject(key="pub", alg="RS256", issuer="iss")
+        client = ConcreteJWKClient(keys={"kid1": key_obj}, cache_ttl=300)
+        await client.get_key("kid1")
+
+        for _ in range(5):
+            with pytest.raises(pyjwt.InvalidKeyError, match="Unknown kid"):
+                await client.get_key("random")
+        assert client.refresh_count == 1
+
+        client._refreshed_at -= client.unknown_kid_refresh_interval
+        with pytest.raises(pyjwt.InvalidKeyError, match="Unknown kid"):
+            await client.get_key("random")
+        assert client.refresh_count == 2
+
+    async def test_concurrent_unknown_kids_refresh_once(self):
+        key_obj = KeyObject(key="pub", alg="RS256", issuer="iss")
+        client = ConcreteJWKClient(keys={"kid1": key_obj}, cache_ttl=300)
+        await client.get_key("kid1")
+        client._refreshed_at -= client.unknown_kid_refresh_interval
+
+        results = await asyncio.gather(
+            *(client.get_key(f"random{i}") for i in range(10)), return_exceptions=True
+        )
+        assert all(isinstance(r, pyjwt.InvalidKeyError) for r in results)
+        assert client.refresh_count == 2
+
+    async def test_known_kid_unaffected_by_throttle(self):
+        key_obj = KeyObject(key="pub", alg="RS256", issuer="iss")
+        client = ConcreteJWKClient(keys={"kid1": key_obj}, cache_ttl=300)
+        await client.get_key("kid1")
+        with pytest.raises(pyjwt.InvalidKeyError):
+            await client.get_key("random")
+        assert await client.get_key("kid1") == key_obj
+        assert client.refresh_count == 1
+
+
+class TestVerifyTokenLogging:
+    async def test_invalid_header_logged_as_warning(self, caplog):
+        client = ConcreteJWKClient()
+        with pytest.raises(pyjwt.InvalidTokenError):
+            await client._verify_token("not-a-jwt")
+        assert caplog.records
+        assert all(r.levelno == logging.WARNING for r in caplog.records)
+
+    async def test_unknown_kid_logged_as_warning(self, caplog):
+        client = ConcreteJWKClient()
+        token = pyjwt.encode({"sub": "x"}, "secret", algorithm="HS256", headers={"kid": "nope"})
+        with pytest.raises(pyjwt.InvalidTokenError):
+            await client._verify_token(token)
+        assert caplog.records
+        assert all(r.levelno == logging.WARNING for r in caplog.records)

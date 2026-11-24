@@ -20,6 +20,8 @@ class KeyObject(NamedTuple):
 
 
 class BaseJWKClient(ABC):
+    unknown_kid_refresh_interval: float = 30.0
+
     def __init__(
         self,
         *,
@@ -34,6 +36,7 @@ class BaseJWKClient(ABC):
         self._lock = asyncio.Lock()
         self._keys_by_kid: dict[str, KeyObject] = {}
         self._expires_at = 0.0
+        self._refreshed_at = float("-inf")
         self._client: httpx.AsyncClient | None = None
 
     @classmethod
@@ -42,7 +45,7 @@ class BaseJWKClient(ABC):
             header = jwt.get_unverified_header(token)
             return header["kid"]
         except (jwt.PyJWTError, AttributeError, KeyError) as e:
-            logger.error("Invalid token header: %s", e)
+            logger.warning("Invalid token header: %s", e)
             raise jwt.InvalidTokenError("Invalid token header") from e
 
     @classmethod
@@ -87,14 +90,12 @@ class BaseJWKClient(ABC):
             self._client = None
 
     async def get_key(self, kid: str) -> KeyObject:
-        now = time.monotonic()
-        if now < self._expires_at and kid in self._keys_by_kid:
-            return self._keys_by_kid[kid]
+        if self._is_cached_or_throttled(kid):
+            return self._lookup(kid)
 
         async with self._lock:
-            # double-check under lock
-            now = time.monotonic()
-            if now >= self._expires_at or kid not in self._keys_by_kid:
+            if not self._is_cached_or_throttled(kid):
+                self._refreshed_at = time.monotonic()
                 new_keys = await self._refresh()
                 if new_keys or not self._keys_by_kid:
                     self._keys_by_kid = new_keys
@@ -103,6 +104,17 @@ class BaseJWKClient(ABC):
                     logger.warning("JWKS refresh returned no keys; keeping stale cache")
                     self._expires_at = time.monotonic() + min(60.0, self._cache_ttl)
 
+        return self._lookup(kid)
+
+    def _is_cached_or_throttled(self, kid: str) -> bool:
+        now = time.monotonic()
+        if now >= self._expires_at:
+            return False
+        return (
+            kid in self._keys_by_kid or now - self._refreshed_at < self.unknown_kid_refresh_interval
+        )
+
+    def _lookup(self, kid: str) -> KeyObject:
         key_object = self._keys_by_kid.get(kid)
         if key_object is None:
             raise jwt.InvalidKeyError("Unknown kid")
@@ -143,7 +155,7 @@ class BaseJWKClient(ABC):
             return payload
 
         except jwt.InvalidKeyError as e:
-            logger.error("Invalid key: %s", e)
+            logger.warning("Invalid key: %s", e)
             raise jwt.InvalidTokenError("Failed to verify token") from e
 
         except jwt.InvalidTokenError:

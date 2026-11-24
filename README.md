@@ -9,7 +9,7 @@ Validating JWT tokens against JWKS endpoints requires:
 - fetching keys from a discovery URL or certs endpoint
 - caching keys with TTL to avoid hitting the endpoint on every request
 - thread-safe refresh under asyncio (double-checked locking)
-- handling key rotation (`kid` lookup + automatic refresh)
+- handling key rotation (`kid` lookup + automatic refresh, at most once per 30 s for unknown `kid`)
 
 `auth-jwks` solves this with a single async client that handles
 discovery, caching, and verification in one call.
